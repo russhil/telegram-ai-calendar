@@ -3,43 +3,26 @@ const bodyParser = require("body-parser");
 const fetch = require("node-fetch");
 const { google } = require("googleapis");
 
+// ===== Environment Variables =====
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
 const GOOGLE_CREDENTIALS = JSON.parse(process.env.GOOGLE_CREDENTIALS);
 const GOOGLE_TOKEN = JSON.parse(process.env.GOOGLE_TOKEN);
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const GEMINI_MODEL = "gemini-2.5-flash";
+
 const app = express();
 app.use(bodyParser.json());
 
-/**
- * Authorize Google Calendar client
- */
-function getCalendarClient() {
-  const { client_secret, client_id, redirect_uris } = GOOGLE_CREDENTIALS.installed || GOOGLE_CREDENTIALS.web;
-  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-  oAuth2Client.setCredentials(GOOGLE_TOKEN);
-  return google.calendar({ version: "v3", auth: oAuth2Client });
-}
+// ===== Google Calendar Setup =====
+const { client_secret, client_id, redirect_uris } = GOOGLE_CREDENTIALS.web;
+const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+oAuth2Client.setCredentials(GOOGLE_TOKEN);
+const calendar = google.calendar({ version: "v3", auth: oAuth2Client });
 
-/**
- * Ask Gemini for a natural language response
- */
-async function askGemini(userText) {
-  const GEMINI_MODEL = "gemini-2.5-flash";
-  const godPrompt = `
-You are a Google Calendar assistant connected to the user's calendar.
-You can:
-- Read, create, delete, and update events.
-- Answer questions about upcoming or past events.
-- Parse natural language like "Add meeting with John tomorrow at 3pm" or "Move my dentist appointment to Friday".
-If the user wants to create or modify events, respond in JSON with this format ONLY:
-{"action":"create","summary":"Meeting name","date":"YYYY-MM-DD","time":"HH:MM"}
-{"action":"list"}
-{"action":"delete","summary":"Meeting name"}
-Otherwise, just answer normally.
-`;
-
+// ===== Gemini AI Call =====
+async function askGemini(prompt) {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
     {
@@ -47,8 +30,10 @@ Otherwise, just answer normally.
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [
-          { parts: [{ text: godPrompt }] },
-          { parts: [{ text: userText }] }
+          {
+            role: "user",
+            parts: [{ text: prompt }]
+          }
         ]
       })
     }
@@ -58,100 +43,75 @@ Otherwise, just answer normally.
   console.log("Gemini raw:", data);
 
   if (data?.candidates?.[0]?.content?.parts?.[0]?.text) {
-    return data.candidates[0].content.parts[0].text.trim();
+    return data.candidates[0].content.parts[0].text;
   }
   return "Sorry, I couldn't get a reply from Gemini.";
 }
 
-/**
- * Handle AI + Google Calendar actions
- */
-async function handleCalendarAction(chatId, aiResponse) {
-  let parsed;
-  try {
-    parsed = JSON.parse(aiResponse);
-  } catch {
-    // Not JSON → Just reply as text
-    return sendMessage(chatId, aiResponse);
-  }
-
-  const calendar = getCalendarClient();
-
-  if (parsed.action === "list") {
-    const res = await calendar.events.list({
-      calendarId: "primary",
-      timeMin: new Date().toISOString(),
-      maxResults: 5,
-      singleEvents: true,
-      orderBy: "startTime",
-    });
-
-    const events = res.data.items;
-    if (!events.length) return sendMessage(chatId, "No upcoming events found.");
-    const list = events.map(e => `${e.summary} at ${e.start.dateTime || e.start.date}`).join("\n");
-    return sendMessage(chatId, `Your upcoming events:\n${list}`);
-  }
-
-  if (parsed.action === "create") {
-    const eventStart = `${parsed.date}T${parsed.time}:00`;
-    const eventEnd = `${parsed.date}T${String(Number(parsed.time.split(":")[0]) + 1).padStart(2, "0")}:${parsed.time.split(":")[1]}:00`;
-    await calendar.events.insert({
-      calendarId: "primary",
-      requestBody: {
-        summary: parsed.summary,
-        start: { dateTime: eventStart, timeZone: "Asia/Kolkata" },
-        end: { dateTime: eventEnd, timeZone: "Asia/Kolkata" },
-      },
-    });
-    return sendMessage(chatId, `Event "${parsed.summary}" created on ${parsed.date} at ${parsed.time}`);
-  }
-
-  if (parsed.action === "delete") {
-    const res = await calendar.events.list({
-      calendarId: "primary",
-      q: parsed.summary,
-      singleEvents: true,
-    });
-    const event = res.data.items[0];
-    if (!event) return sendMessage(chatId, `No event found with name "${parsed.summary}"`);
-    await calendar.events.delete({ calendarId: "primary", eventId: event.id });
-    return sendMessage(chatId, `Event "${parsed.summary}" deleted.`);
-  }
-
-  return sendMessage(chatId, aiResponse);
-}
-
-/**
- * Send message to Telegram
- */
-async function sendMessage(chatId, text) {
-  await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
-  });
-}
-
-/**
- * Webhook endpoint
- */
+// ===== Handle Telegram Messages =====
 app.post("/", async (req, res) => {
-  const chatId = req.body?.message?.chat?.id;
-  const userText = req.body?.message?.text;
-  if (!chatId || !userText) return res.sendStatus(200);
+  console.log("Incoming Telegram update:", req.body);
 
   try {
-    const aiResponse = await askGemini(userText);
-    await handleCalendarAction(chatId, aiResponse);
+    const chatId = req.body?.message?.chat?.id;
+    const userText = req.body?.message?.text;
+
+    if (!chatId || !userText) {
+      return res.sendStatus(200);
+    }
+
+    let replyText = "";
+
+    // Calendar commands
+    if (/create event/i.test(userText)) {
+      const event = {
+        summary: "Test Event from Telegram Bot",
+        start: { dateTime: new Date().toISOString(), timeZone: "Asia/Kolkata" },
+        end: {
+          dateTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          timeZone: "Asia/Kolkata"
+        }
+      };
+      await calendar.events.insert({ calendarId: "primary", resource: event });
+      replyText = "✅ Event created successfully in your Google Calendar!";
+    } else if (/upcoming events/i.test(userText)) {
+      const eventsRes = await calendar.events.list({
+        calendarId: "primary",
+        timeMin: new Date().toISOString(),
+        maxResults: 5,
+        singleEvents: true,
+        orderBy: "startTime"
+      });
+      const events = eventsRes.data.items;
+      if (events.length) {
+        replyText = "📅 Upcoming events:\n" + events.map(e => `- ${e.summary}`).join("\n");
+      } else {
+        replyText = "No upcoming events found.";
+      }
+    } else {
+      // Fallback to Gemini
+      replyText = await askGemini(userText);
+    }
+
+    // Send reply to Telegram
+    await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: replyText })
+    });
   } catch (err) {
     console.error("Error handling message:", err);
-    await sendMessage(chatId, "Something went wrong.");
   }
 
   res.sendStatus(200);
 });
 
-app.get("/", (req, res) => res.send("Bot is running with Gemini + Google Calendar"));
+// ===== Root Endpoint =====
+app.get("/", (req, res) => {
+  res.send("Bot is running with Gemini + Google Calendar API");
+});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server is listening on port ${PORT}`);
+});
