@@ -67,64 +67,63 @@ GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
 SYSTEM_INSTRUCTION = """
-You are a powerful and efficient calendar assistant. Your job is to understand a user's natural language request and output a JSON object that specifies exactly one Google Calendar action.
+You are a deterministic natural language to structured command translator for Google Calendar.
+You MUST always return ONLY a single valid JSON object, never text, explanations, or code fences.
 
----
-Core Instructions & Tool Guide
----
-1. Default calendar: Always use "CalBotCal" unless the user specifies another.
-2. If "CalBotCal" does not exist, include a step to create it before performing other actions.
-3. Allowed intents:
-   - "create"
-   - "list"
-   - "delete"
-   - "modify"
-   - "list_calendars"
-   - "create_calendar"
-   - "delete_calendar"
-4. Ask user for confirmation before `delete_calendar`.
-
----
-JSON Rules
----
-- Always return ONLY valid JSON (no markdown, no code fences, no commentary).
-- Dates/times must be full ISO strings with timezone offset.
-- If only date: default 09:00–10:00 in BOT_TZ.
-- If only time: assume today.
-- For list: include optional `max_results` (default 5) and `starting_from` (default now).
-- For delete: match event name as closely as possible.
-- Always include `"calendar_id"`.
-
-Example:
+Output format (strict):
 {
-  "intent": "create",
-  "calendar_id": "calbotcal_id_here",
-  "summary": "Team Meeting",
-  "start": "2025-08-11T09:00:00+05:30",
-  "end": "2025-08-11T10:00:00+05:30"
+  "intent": "create" | "list" | "delete",
+  "summary": "string (for create/delete)",
+  "start": "ISO 8601 datetime with offset",
+  "end": "ISO 8601 datetime with offset",
+  "starting_from": "ISO 8601 datetime with offset (optional, list intent only)",
+  "max_results": integer (optional, list intent only)
 }
+
+Rules:
+1. Infer the intent from the user request even if they don’t explicitly say “create” or “list”.
+2. If the request is about adding, scheduling, or planning — intent = "create".
+3. If the request is about checking, showing, or viewing — intent = "list".
+4. If the request is about removing, cancelling, or deleting — intent = "delete".
+5. Resolve relative times (“tomorrow”, “next Monday”, “tonight”) to the correct ISO 8601 in NOW_TZ.
+6. If only a date is given, default start time = 09:00, end time = 10:00 in NOW_TZ.
+7. If only a time is given, assume today in NOW_TZ.
+8. If deleting and no time is provided, delete the nearest match to NOW.
+9. Strip emojis from the summary.
+10. Do not ask questions — make reasonable assumptions.
 """
 
 # -----------------------------
 # Gemini Parsing
 # -----------------------------
-def gemini_parse_command(user_text, tz_name):
-    now_iso = to_iso(now_in_tz(tz_name))
+def gemini_parse_command(user_text: str, tz_name: str) -> dict | None:
+    now_local = now_in_tz(tz_name)
+    now_iso = to_iso(now_local)
+
     body = {
-        "systemInstruction": {"role": "system", "parts": [{"text": SYSTEM_INSTRUCTION}]},
+        "systemInstruction": {
+            "role": "system",
+            "parts": [{"text": SYSTEM_INSTRUCTION}]
+        },
         "generationConfig": {
             "temperature": 0,
-            "topK": 32,
-            "topP": 0.9,
+            "topK": 1,
+            "topP": 0,
             "candidateCount": 1,
-            "responseMimeType": "application/json",
+            "responseMimeType": "application/json"
         },
-        "contents": [{
-            "role": "user",
-            "parts": [{
-                "text": f"NOW_TZ: {tz_name}\nNOW_ISO: {now_iso}\nUser request: {user_text}"
-            }]
-        }]
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{
+                    "text": (
+                        f"NOW_TZ: {tz_name}\n"
+                        f"NOW_ISO: {now_iso}\n"
+                        f"User request: {user_text}"
+                    )
+                }]
+            }
+        ]
     }
 
     try:
@@ -133,40 +132,25 @@ def gemini_parse_command(user_text, tz_name):
         payload = r.json()
         log.info("Gemini raw: %s", payload)
 
-        # Extract text safely
         text = None
         cand = (payload.get("candidates") or [{}])[0]
         content = cand.get("content") or {}
         parts = content.get("parts") or []
         if parts and isinstance(parts[0], dict):
-            text = parts[0].get("text", "")
+            text = parts[0].get("text")
 
         if not text:
             return None
 
         text = text.strip()
-        # Extract JSON block if model wraps in text
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if m:
             text = m.group(0)
 
-        data = json.loads(text)
-
-        # Auto-guess intent if missing
-        if "intent" not in data:
-            lowered = user_text.lower()
-            if any(k in lowered for k in ["add", "schedule", "create", "book"]):
-                data["intent"] = "create"
-            elif any(k in lowered for k in ["delete", "remove", "cancel"]):
-                data["intent"] = "delete"
-            elif any(k in lowered for k in ["show", "list", "what's", "upcoming"]):
-                data["intent"] = "list"
-
-        return data
+        return json.loads(text)
     except Exception as e:
         log.error("Gemini parse error: %s", e)
         return None
-
 # -----------------------------
 # Calendar Actions
 # -----------------------------
